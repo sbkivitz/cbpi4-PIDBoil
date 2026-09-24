@@ -79,6 +79,14 @@ class PIDBoil(CBPiKettleLogic):
     # full-power boil.
     DEFAULT_BOIL_OUTPUT = 85
 
+    # PID defaults were tuned in Celsius. They are output-percent-per-degree
+    # gains, so a Fahrenheit server needs smaller numeric defaults because the
+    # same physical error is 1.8 times as many degrees.
+    DEFAULT_P_C = 117.0795
+    DEFAULT_I_C = 0.2747
+    DEFAULT_D_C = 41.58
+    DEFAULT_GAIN_TOLERANCE = 0.000001
+
     # How little a vessel must rise to count as having stopped, in degrees.
     # A 5.5kW element in 40 litres climbs about 2 degrees a minute, so anything
     # this small over several minutes is not a heat-up.
@@ -92,6 +100,32 @@ class PIDBoil(CBPiKettleLogic):
     # How far the temperature must fall below the plateau before boiling is
     # considered over - enough that noise cannot rattle it in and out.
     PLATEAU_EXIT_DROP = 2.0
+
+    def _degree_ratio(self):
+        return 1.0 if self.TEMP_UNIT == "C" else 1.8
+
+    def _pid_gain(self, label, celsius_default, degree_ratio):
+        configured = self.props.get(label)
+        if configured is None or configured == "":
+            return celsius_default / degree_ratio, True
+        return float(configured), False
+
+    def _has_legacy_celsius_default_gains(self):
+        if self.TEMP_UNIT == "C":
+            return False
+        try:
+            configured = {
+                "P": float(self.props.get("P")),
+                "I": float(self.props.get("I")),
+                "D": float(self.props.get("D")),
+            }
+        except (TypeError, ValueError):
+            return False
+        return (
+            abs(configured["P"] - self.DEFAULT_P_C) <= self.DEFAULT_GAIN_TOLERANCE
+            and abs(configured["I"] - self.DEFAULT_I_C) <= self.DEFAULT_GAIN_TOLERANCE
+            and abs(configured["D"] - self.DEFAULT_D_C) <= self.DEFAULT_GAIN_TOLERANCE
+        )
 
     def _detect_boil_by_plateau(self, value, demand, maxout, window):
         """Is the wort boiling, judged by behaviour rather than by a number?
@@ -143,12 +177,24 @@ class PIDBoil(CBPiKettleLogic):
             state = self.get_sensor_value(sensor_id)
             value = float(state.get("value"))
         except (AttributeError, TypeError, ValueError):
+            logging.warning(
+                "PIDBoil: ignoring sensor %s, reading is missing or non-numeric",
+                sensor_id,
+            )
             return None
 
         age = state.get("age")
-        if age is not None and age > self.MAX_SENSOR_AGE:
+        # The sensor's own cadence, not a fixed number of seconds. A OneWire
+        # probe on its default 60s interval is legitimately 59s old, and
+        # cutting heat on that cycles the element every minute of a brew day
+        # with nothing wrong. See SensorController.expected_max_age().
+        limit = state.get("max_age") or self.MAX_SENSOR_AGE
+        if age is not None and age > limit:
             logging.warning(
-                "PIDBoil: ignoring sensor %s, last updated %.0fs ago", sensor_id, age
+                "PIDBoil: ignoring sensor %s, last updated %.0fs ago (limit %.0fs)",
+                sensor_id,
+                age,
+                limit,
             )
             return None
 
@@ -167,9 +213,15 @@ class PIDBoil(CBPiKettleLogic):
             sampleTime = int(self.props.get("SampleTime",5))
             boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
 
-            p = float(self.props.get("P", 117.0795))
-            i = float(self.props.get("I", 0.2747))
-            d = float(self.props.get("D", 41.58))
+            degree_ratio = self._degree_ratio()
+            p, p_defaulted = self._pid_gain("P", self.DEFAULT_P_C, degree_ratio)
+            i, i_defaulted = self._pid_gain("I", self.DEFAULT_I_C, degree_ratio)
+            d, d_defaulted = self._pid_gain("D", self.DEFAULT_D_C, degree_ratio)
+            legacy_default_gains = self._has_legacy_celsius_default_gains()
+            if legacy_default_gains:
+                p = self.DEFAULT_P_C / degree_ratio
+                i = self.DEFAULT_I_C / degree_ratio
+                d = self.DEFAULT_D_C / degree_ratio
             maxout = int(self.props.get("Max_Output", 100))
             maxtempboil = float(self.props.get("Boil_Threshold", boilthreshold))
             maxboilout = int(self.props.get("Max_Boil_Output", self.DEFAULT_BOIL_OUTPUT))
@@ -197,6 +249,27 @@ class PIDBoil(CBPiKettleLogic):
             pid = PIDArduino(
                 sampleTime, p, i, d, 0, maxout, getTimeMs=lambda: clock.now() * 1000
             )
+            logging.info(
+                "PIDBoil effective gains for %s: P=%.6g%s I=%.6g%s D=%.6g%s",
+                self.TEMP_UNIT, p,
+                " legacy-C-default converted" if legacy_default_gains
+                else " default" if p_defaulted else " configured",
+                i,
+                " legacy-C-default converted" if legacy_default_gains
+                else " default" if i_defaulted else " configured",
+                d,
+                " legacy-C-default converted" if legacy_default_gains
+                else " default" if d_defaulted else " configured",
+            )
+            if legacy_default_gains:
+                message = (
+                    "PIDBoil found persisted Celsius default gains on a Fahrenheit "
+                    "server and is running converted effective gains: "
+                    "P={:.4f}, I={:.4f}, D={:.4f}. The saved props were not "
+                    "rewritten; edit P/I/D if these are not intended."
+                ).format(p, i, d)
+                logging.warning(message)
+                self.cbpi.notify("PIDBoil gain units", message, NotificationType.WARNING)
 
             sensor_failures = 0
             fault_notified = False
@@ -216,7 +289,6 @@ class PIDBoil(CBPiKettleLogic):
             dry_watch = DryFireWatch() if DryFireWatch else None
             dry_litres = max(0.0, float(self.props.get("Volume_Litres", 0) or 0))
             dry_watts = max(0.0, float(self.props.get("Element_Watts", 0) or 0))
-            degree_ratio = 1.0 if self.TEMP_UNIT == "C" else 1.8
             # How far below the boil it must fall before fixed-power mode is
             # released. In degrees of the configured unit, so the band means the
             # same amount of physics either way.
