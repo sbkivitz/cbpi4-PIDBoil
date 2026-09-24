@@ -47,7 +47,8 @@ except ImportError:  # pragma: no cover - depends on the host installation
              Property.Select(label="SampleTime", options=[2,5], description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
              Property.Number(label = "Max_Output", configurable = True, description="Power before Boil threshold is reached."),
              Property.Number(label = "Boil_Threshold", configurable = True, description="When this temperature is reached, power will be set to Max Boil Output (default: 98 °C/208 F)"),
-             Property.Number(label = "Max_Boil_Output", configurable = True, default_value = 85, description="Power when Boil Threshold is reached.")])
+             Property.Number(label = "Max_Boil_Output", configurable = True, default_value = 85, description="Power when Boil Threshold is reached."),
+             Property.Number(label = "Boil_Plateau_Minutes", configurable = True, default_value = 3, description="Also treat a stalled temperature at full power as boiling, after this many minutes. 0 disables.")])
 
 class PIDBoil(CBPiKettleLogic):
 
@@ -68,6 +69,58 @@ class PIDBoil(CBPiKettleLogic):
     # so a brewer who left the field alone saw 85 in the interface and got a
     # full-power boil.
     DEFAULT_BOIL_OUTPUT = 85
+
+    # How little a vessel must rise to count as having stopped, in degrees.
+    # A 5.5kW element in 40 litres climbs about 2 degrees a minute, so anything
+    # this small over several minutes is not a heat-up.
+    PLATEAU_MIN_RISE = 0.5
+
+    # How close to full the demand must be for a plateau to mean anything. Below
+    # this the controller is easing off on purpose and a flat temperature is it
+    # working, not the wort boiling.
+    PLATEAU_MIN_DEMAND = 0.9
+
+    # How far the temperature must fall below the plateau before boiling is
+    # considered over - enough that noise cannot rattle it in and out.
+    PLATEAU_EXIT_DROP = 2.0
+
+    def _detect_boil_by_plateau(self, value, demand, maxout, window):
+        """Is the wort boiling, judged by behaviour rather than by a number?
+
+        Boil_Threshold is an absolute temperature, and absolute temperatures are
+        the least reliable thing on a brew rig. A probe reading two degrees low,
+        a brewer at altitude whose wort boils at 94 C, or simply a threshold
+        typed in above the real boiling point, all produce the same outcome: the
+        step never dials back and the kettle runs at full power into a rolling
+        boil. That is how a boilover happens.
+
+        Boiling has a signature that does not depend on calibration. At the
+        boiling point energy stops raising temperature - it goes into vapour
+        instead - so a vessel that has stopped climbing while the controller is
+        still asking for everything it has is boiling, whatever the number says.
+
+        Getting this wrong the other way is harmless: a dead element also stops
+        rising, and deciding "boiling" then simply drops demand on an element
+        that is not heating anyway.
+        """
+        if window <= 0:
+            return False
+        if maxout <= 0 or demand < maxout * self.PLATEAU_MIN_DEMAND:
+            # Not asking for everything, so a flat temperature says nothing.
+            self._plateau_since = None
+            self._plateau_anchor = None
+            return False
+
+        now = clock.now()
+        if self._plateau_anchor is None or value > self._plateau_anchor + self.PLATEAU_MIN_RISE:
+            self._plateau_anchor = value
+            self._plateau_since = now
+            return False
+        if value < self._plateau_anchor:
+            self._plateau_anchor = value
+            self._plateau_since = now
+            return False
+        return (now - self._plateau_since) >= window
 
     def _read_temp(self, sensor_id):
         """Current temperature, or None if it cannot be trusted.
@@ -139,6 +192,12 @@ class PIDBoil(CBPiKettleLogic):
             sensor_failures = 0
             fault_notified = False
             in_boil = False
+            boiling_by_plateau = False
+            plateau_window = max(0.0, float(
+                self.props.get("Boil_Plateau_Minutes", 3) or 0
+            )) * 60.0
+            self._plateau_since = None
+            self._plateau_anchor = None
 
             while self.running == True:
                 current_temp = self._read_temp(self.kettle.sensor)
@@ -177,10 +236,27 @@ class PIDBoil(CBPiKettleLogic):
                 sensor_failures = 0
                 fault_notified = False
 
-                if current_temp >= maxtempboil:
+                if current_temp >= maxtempboil or boiling_by_plateau:
                     # Boiling: hold a fixed power rather than a temperature.
                     heat_percent = maxboilout
-                    in_boil = True
+                    if not in_boil:
+                        in_boil = True
+                        if boiling_by_plateau and current_temp < maxtempboil:
+                            self.cbpi.notify(
+                                "{}".format(getattr(self.kettle, "name", "Kettle")),
+                                "Boiling at {:.1f}, below the {:.1f} threshold - "
+                                "holding {}% anyway. Check the Boil_Threshold and "
+                                "the probe calibration.".format(
+                                    current_temp, maxtempboil, maxboilout
+                                ),
+                                NotificationType.WARNING,
+                            )
+                    # Stay in fixed power until it has genuinely come off the
+                    # boil, not the moment a tenth of a degree of noise says so.
+                    if current_temp < maxtempboil - self.PLATEAU_EXIT_DROP:
+                        boiling_by_plateau = self._detect_boil_by_plateau(
+                            current_temp, heat_percent, maxout, plateau_window
+                        )
                 else:
                     if in_boil:
                         # Coming back out of fixed-power mode after the PID has
@@ -191,6 +267,12 @@ class PIDBoil(CBPiKettleLogic):
                         pid.resync(current_temp)
                         in_boil = False
                     heat_percent = pid.calc(current_temp, target_temp)
+                    # Judged on what was just asked for: if the controller wants
+                    # everything it has and the wort has stopped responding, it
+                    # is boiling regardless of what the threshold says.
+                    boiling_by_plateau = self._detect_boil_by_plateau(
+                        current_temp, heat_percent, maxout, plateau_window
+                    )
 
                 # Drive the actor's on/off state, not just its power level.
                 # set_power() only forwards a number to the instance; it never
