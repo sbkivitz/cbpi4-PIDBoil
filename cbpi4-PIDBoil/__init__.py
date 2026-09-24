@@ -40,6 +40,13 @@ except ImportError:  # pragma: no cover - depends on the host installation
 
     clock = _RealClock()
 
+try:
+    # Same reasoning as the clock import: only forks carry this, and a plugin
+    # that cannot load is worse than one without dry-fire protection.
+    from cbpi.api.dryfire import DryFireWatch
+except ImportError:  # pragma: no cover - depends on the host installation
+    DryFireWatch = None
+
 
 @parameters([Property.Number(label = "P", configurable = True, description="P Value of PID"),
              Property.Number(label = "I", configurable = True, description="I Value of PID"),
@@ -48,7 +55,9 @@ except ImportError:  # pragma: no cover - depends on the host installation
              Property.Number(label = "Max_Output", configurable = True, description="Power before Boil threshold is reached."),
              Property.Number(label = "Boil_Threshold", configurable = True, description="When this temperature is reached, power will be set to Max Boil Output (default: 98 °C/208 F)"),
              Property.Number(label = "Max_Boil_Output", configurable = True, default_value = 85, description="Power when Boil Threshold is reached."),
-             Property.Number(label = "Boil_Plateau_Minutes", configurable = True, default_value = 3, description="Also treat a stalled temperature at full power as boiling, after this many minutes. 0 disables.")])
+             Property.Number(label = "Boil_Plateau_Minutes", configurable = True, default_value = 3, description="Also treat a stalled temperature at full power as boiling, after this many minutes. 0 disables."),
+             Property.Number(label = "Volume_Litres", configurable = True, default_value = 0, description="Litres in the vessel. With Element_Watts, enables dry-fire protection. 0 disables."),
+             Property.Number(label = "Element_Watts", configurable = True, default_value = 0, description="Element rating in watts. With Volume_Litres, enables dry-fire protection. 0 disables.")])
 
 class PIDBoil(CBPiKettleLogic):
 
@@ -193,11 +202,25 @@ class PIDBoil(CBPiKettleLogic):
             fault_notified = False
             in_boil = False
             boiling_by_plateau = False
+            boil_latched = False
+            boil_entry_temp = None
             plateau_window = max(0.0, float(
                 self.props.get("Boil_Plateau_Minutes", 3) or 0
             )) * 60.0
             self._plateau_since = None
             self._plateau_anchor = None
+
+            # Dry-fire protection. Needs two facts no kettle carries - how much
+            # liquid is in it and how big the element is - so it does nothing at
+            # all until both are configured.
+            dry_watch = DryFireWatch() if DryFireWatch else None
+            dry_litres = max(0.0, float(self.props.get("Volume_Litres", 0) or 0))
+            dry_watts = max(0.0, float(self.props.get("Element_Watts", 0) or 0))
+            degree_ratio = 1.0 if self.TEMP_UNIT == "C" else 1.8
+            # How far below the boil it must fall before fixed-power mode is
+            # released. In degrees of the configured unit, so the band means the
+            # same amount of physics either way.
+            exit_drop = self.PLATEAU_EXIT_DROP * degree_ratio
 
             while self.running == True:
                 current_temp = self._read_temp(self.kettle.sensor)
@@ -236,11 +259,39 @@ class PIDBoil(CBPiKettleLogic):
                 sensor_failures = 0
                 fault_notified = False
 
-                if current_temp >= maxtempboil or boiling_by_plateau:
+                # Rising faster than the configured liquid allows means there is
+                # no liquid. Judged against the power actually being delivered -
+                # the previous demand, which is what produced the rise now being
+                # measured. Zero demand passes zero watts, which switches the
+                # guard off rather than on: a vessel warming with its element
+                # idle is being heated by something else and is not this loop's
+                # business.
+                #
+                # Acted on rather than merely reported. This is the one fault
+                # where continuing to control is worse than stopping.
+                delivered_watts = dry_watts * float(heat_percent_old or 0) / 100.0
+                if dry_watch is not None and dry_watch.note(
+                    current_temp, delivered_watts, dry_litres, degree_ratio
+                ):
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
+                    self.cbpi.notify(
+                        "Dry fire",
+                        dry_watch.describe(
+                            getattr(self.kettle, "name", "Kettle"), dry_litres
+                        ),
+                        NotificationType.ERROR,
+                    )
+                    self.running = False
+                    break
+
+                if current_temp >= maxtempboil or boiling_by_plateau or boil_latched:
                     # Boiling: hold a fixed power rather than a temperature.
                     heat_percent = maxboilout
-                    if not in_boil:
-                        in_boil = True
+                    if not boil_latched:
+                        boil_latched = True
+                        boil_entry_temp = current_temp
                         if boiling_by_plateau and current_temp < maxtempboil:
                             self.cbpi.notify(
                                 "{}".format(getattr(self.kettle, "name", "Kettle")),
@@ -251,12 +302,21 @@ class PIDBoil(CBPiKettleLogic):
                                 ),
                                 NotificationType.WARNING,
                             )
-                    # Stay in fixed power until it has genuinely come off the
-                    # boil, not the moment a tenth of a degree of noise says so.
-                    if current_temp < maxtempboil - self.PLATEAU_EXIT_DROP:
-                        boiling_by_plateau = self._detect_boil_by_plateau(
-                            current_temp, heat_percent, maxout, plateau_window
-                        )
+                    in_boil = True
+                    # Latched on purpose, and detection is NOT re-run here.
+                    #
+                    # Fixed-power mode commands Max_Boil_Output, which is below
+                    # the near-full demand the plateau detector requires. Asking
+                    # it again at that reduced demand cleared the state, dropped
+                    # the loop back to full power, and produced a saw-tooth
+                    # between 100% and 85% - worse than never having noticed the
+                    # boil. It leaves only when the wort has genuinely come off
+                    # the boil, measured from where it started boiling.
+                    if current_temp < boil_entry_temp - exit_drop:
+                        boil_latched = False
+                        boiling_by_plateau = False
+                        self._plateau_since = None
+                        self._plateau_anchor = None
                 else:
                     if in_boil:
                         # Coming back out of fixed-power mode after the PID has
