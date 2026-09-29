@@ -198,6 +198,51 @@ class PIDBoil(CBPiKettleLogic):
         if heater is not None:
             await self.actor_off(heater)
 
+    def _heater_now(self):
+        """What the heater actor is actually doing: (on, power, known).
+
+        Read rather than remembered. The loop tracked heater_is_on and
+        heat_percent_old in locals and commanded only on a believed transition,
+        so anything else touching the actor left the loop wrong for the rest of
+        the brew: switch the element off from the dashboard and the loop went
+        on believing it was driving it, and never commanded again.
+
+        Reported on this rig, and the same defect ActorController.off had -
+        acting only when the software already believed the actor was on makes
+        OFF a no-op exactly when it is needed.
+
+        The driver's state is preferred over the container's: find_by_id
+        returns a container whose `instance` is the driver, and commands update
+        the instance, so reading the container can report off while the element
+        is on.
+
+        known=False means "no idea" and must not be read as off, because off
+        means command it on. The caller then keeps what it last commanded
+        rather than re-issuing every pass, which on a duty-cycling actor can
+        restart its on-phase and deliver more power than asked for.
+
+        Never raises.
+        """
+        try:
+            registry = getattr(self.cbpi, "actor", None)
+            if registry is None:
+                return False, None, False
+            actor = registry.find_by_id(self.heater)
+            if actor is None:
+                return False, None, True
+            instance = getattr(actor, "instance", None)
+            if instance is not None:
+                state = getattr(instance, "state", None)
+                power = getattr(instance, "power", getattr(actor, "power", None))
+            else:
+                state = getattr(actor, "state", None)
+                power = getattr(actor, "power", None)
+            if state is None:
+                return False, None, False
+            return bool(state), power, True
+        except Exception:  # noqa: BLE001
+            return False, None, False
+
     async def run(self):
         try:
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
@@ -293,9 +338,13 @@ class PIDBoil(CBPiKettleLogic):
                     # for the rest of the brew after a single bad read, with
                     # nothing said to the brewer.
                     sensor_failures += 1
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
+                    # Unconditional, for the same reason as the zero-demand
+                    # path below: this used to act only when the loop believed
+                    # the heater was on, so a swallowed OFF failure flipped the
+                    # flag and it never retried - leaving an element energized
+                    # on a sensor fault, which is the one case it exists for.
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
                     heat_percent_old = None
                     if sensor_failures >= self.MAX_SENSOR_FAILURES and not fault_notified:
                         fault_notified = True
@@ -368,18 +417,30 @@ class PIDBoil(CBPiKettleLogic):
                 # set_power() only forwards a number to the instance; it never
                 # changes state, so a demand of 0% left a plain GPIOActor
                 # nominally on at 0% duty rather than genuinely off.
+                # Drive the actor from what it IS doing, not from what this loop
+                # last told it to do. See _heater_now: belief about hardware
+                # goes stale the moment anything else touches the actor, and on
+                # a rig the brewer is something else that touches it.
+                actual_on, actual_power, known = self._heater_now()
+                if not known:
+                    actual_on = heater_is_on
+                    actual_power = heat_percent_old
+
                 if heat_percent > 0:
-                    if not heater_is_on:
+                    if not actual_on:
                         await self.actor_on(self.heater, heat_percent)
-                        heater_is_on = True
-                        heat_percent_old = heat_percent
-                    elif heat_percent != heat_percent_old:
+                    elif actual_power != heat_percent:
                         await self.actor_set_power(self.heater, heat_percent)
-                        heat_percent_old = heat_percent
+                    heater_is_on = True
+                    heat_percent_old = heat_percent
                 else:
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
+                    # Unconditional: commanding off something already off costs
+                    # one redundant call, while not commanding off something
+                    # that IS on is how an element stays live. The guard here
+                    # also stopped retrying after a swallowed failure had left
+                    # the local flag false.
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
                     heat_percent_old = 0
 
                 await clock.sleep(sampleTime)
