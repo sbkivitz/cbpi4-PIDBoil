@@ -443,6 +443,15 @@ class PIDBoil(CBPiKettleLogic):
                     heater_is_on = False
                     heat_percent_old = 0
 
+                # Record what the controller asked for, when the brewer wants
+                # it. The temperature alone cannot tell a mistuned PID from an
+                # undersized element or a laggy probe; the duty curve can.
+                # Written under this kettle's id so it charts beside the
+                # temperature with no extra plumbing.
+                if self.pid_logging_enabled():
+                    self.log_data("duty", round(float(heat_percent), 2))
+                    self.log_data("setpoint", round(float(target_temp), 2))
+
                 await clock.sleep(sampleTime)
 
         except asyncio.CancelledError as e:
