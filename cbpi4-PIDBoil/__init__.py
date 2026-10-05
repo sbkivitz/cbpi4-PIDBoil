@@ -245,22 +245,21 @@ class PIDBoil(CBPiKettleLogic):
 
     async def run(self):
         try:
-            self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
-            sampleTime = int(self.props.get("SampleTime",5))
-            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
-
-            degree_ratio = self._degree_ratio()
-            p, p_defaulted = self._pid_gain("P", self.DEFAULT_P_C, degree_ratio)
-            i, i_defaulted = self._pid_gain("I", self.DEFAULT_I_C, degree_ratio)
-            d, d_defaulted = self._pid_gain("D", self.DEFAULT_D_C, degree_ratio)
-            legacy_default_gains = self._has_legacy_celsius_default_gains()
-            if legacy_default_gains:
-                p = self.DEFAULT_P_C / degree_ratio
-                i = self.DEFAULT_I_C / degree_ratio
-                d = self.DEFAULT_D_C / degree_ratio
-            maxout = int(self.props.get("Max_Output", 100))
-            maxtempboil = float(self.props.get("Boil_Threshold", boilthreshold))
-            maxboilout = int(self.props.get("Max_Boil_Output", self.DEFAULT_BOIL_OUTPUT))
+            # Identify the actuator and establish it off BEFORE anything that
+            # can fail.
+            #
+            # This sat below the setting parsing, and those parses can raise -
+            # int("abc") on a SampleTime, float("") on a threshold. When they
+            # did, run() went to its finally, which could not command a heater
+            # it had never resolved. On a rig driven by hand that is the
+            # dangerous case: the brewer switches an element on manually, starts
+            # the logic, a malformed setting aborts the startup, and the element
+            # keeps running with no control loop, no sensor being read and no
+            # limits - while the interface shows the logic as stopped.
+            #
+            # Same correction as PIDHerms. The actuator has to be resolved
+            # before anything is allowed to go wrong, because resolving it is
+            # what makes the cleanup able to act at all.
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
             self.heater_actor = self.cbpi.actor.find_by_id(self.heater)
@@ -279,6 +278,24 @@ class PIDBoil(CBPiKettleLogic):
             # on by a previous run would otherwise stay on while this loop
             # believed it was off.
             await self.actor_off(self.heater)
+
+            self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
+            sampleTime = int(self.props.get("SampleTime",5))
+            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
+
+            degree_ratio = self._degree_ratio()
+            p, p_defaulted = self._pid_gain("P", self.DEFAULT_P_C, degree_ratio)
+            i, i_defaulted = self._pid_gain("I", self.DEFAULT_I_C, degree_ratio)
+            d, d_defaulted = self._pid_gain("D", self.DEFAULT_D_C, degree_ratio)
+            legacy_default_gains = self._has_legacy_celsius_default_gains()
+            if legacy_default_gains:
+                p = self.DEFAULT_P_C / degree_ratio
+                i = self.DEFAULT_I_C / degree_ratio
+                d = self.DEFAULT_D_C / degree_ratio
+            maxout = int(self.props.get("Max_Output", 100))
+            maxtempboil = float(self.props.get("Boil_Threshold", boilthreshold))
+            maxboilout = int(self.props.get("Max_Boil_Output", self.DEFAULT_BOIL_OUTPUT))
+
             heater_is_on = False
             heat_percent_old = None
 
