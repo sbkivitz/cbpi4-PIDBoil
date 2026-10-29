@@ -29,6 +29,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 
 ### Changelog
 
+- 29.10.26: (0.0.9.post2, sbkivitz fork) A temperature reading - or a target - that is not a finite number is treated as no reading: the element off, the brewer told, heating back when a real reading returns. Before, +inf chose the fixed boil power (85% by default) for as long as it lasted, and one NaN stuck in the PID's integral, so the element never heated again that brew.
 - 29.12.22: (0.0.9) Fixed Bug related to Boil Threshold Parameter
 - 10.05.22: (0.0.8) Updated README (removed cbpi add)
 - 10.05.22: (0.0.7) Removed cbpi dependency

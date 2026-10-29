@@ -8,6 +8,7 @@ percentage the brewer chooses.
 
 import asyncio
 import logging
+import math
 import time
 
 from cbpi.api import *
@@ -171,6 +172,18 @@ class PIDBoil(CBPiKettleLogic):
             logging.warning(
                 "PIDBoil: ignoring sensor %s, reading is missing or non-numeric",
                 sensor_id,
+            )
+            return None
+        # float() accepts "inf" and "nan", and nothing downstream refused them:
+        # +inf is above any Boil_Threshold, so the loop chose fixed boil power
+        # (85% on the rig's HLT) for as long as the reading stayed broken; a NaN
+        # stuck in the PID's integral and the element never heated again that
+        # brew. Neither is a temperature - treat them as no reading.
+        if not math.isfinite(value):
+            logging.warning(
+                "PIDBoil: ignoring sensor %s, reading %r is not a finite number",
+                sensor_id,
+                value,
             )
             return None
 
@@ -347,6 +360,9 @@ class PIDBoil(CBPiKettleLogic):
                 try:
                     target_temp = float(target_temp)
                 except (TypeError, ValueError):
+                    target_temp = None
+                # An infinite target drove the PID flat out at any reading.
+                if target_temp is not None and not math.isfinite(target_temp):
                     target_temp = None
 
                 if current_temp is None or target_temp is None:
