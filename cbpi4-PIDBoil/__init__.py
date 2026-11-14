@@ -66,12 +66,11 @@ class PIDBoil(CBPiKettleLogic):
     MAX_SENSOR_AGE = 30
 
     # Default power once boiling. Matches the default_value declared on the
-    # property above, which the code used to contradict by defaulting to 100 -
-    # so a brewer who left the field alone saw 85 in the interface and got a
-    # full-power boil.
+    # property above: any other default here - 100, say - would show a brewer
+    # who left the field alone 85 in the interface and give a full-power boil.
     DEFAULT_BOIL_OUTPUT = 85
 
-    # PID defaults were tuned in Celsius. They are output-percent-per-degree
+    # PID defaults are tuned in Celsius. They are output-percent-per-degree
     # gains, so a Fahrenheit server needs smaller numeric defaults because the
     # same physical error is 1.8 times as many degrees.
     DEFAULT_P_C = 117.0795
@@ -174,11 +173,12 @@ class PIDBoil(CBPiKettleLogic):
                 sensor_id,
             )
             return None
-        # float() accepts "inf" and "nan", and nothing downstream refused them:
-        # +inf is above any Boil_Threshold, so the loop chose fixed boil power
-        # (85% on the rig's HLT) for as long as the reading stayed broken; a NaN
-        # stuck in the PID's integral and the element never heated again that
-        # brew. Neither is a temperature - treat them as no reading.
+        # float() accepts "inf" and "nan", and nothing downstream refuses them:
+        # +inf is above any Boil_Threshold, so the loop would choose fixed boil
+        # power (85% on the rig's HLT) for as long as the reading stayed broken;
+        # a NaN would stick in the PID's integral and the element would never
+        # heat again that brew. Neither is a temperature - treat them as no
+        # reading.
         if not math.isfinite(value):
             logging.warning(
                 "PIDBoil: ignoring sensor %s, reading %r is not a finite number",
@@ -214,15 +214,12 @@ class PIDBoil(CBPiKettleLogic):
     def _heater_now(self):
         """What the heater actor is actually doing: (on, power, known).
 
-        Read rather than remembered. The loop tracked heater_is_on and
-        heat_percent_old in locals and commanded only on a believed transition,
-        so anything else touching the actor left the loop wrong for the rest of
-        the brew: switch the element off from the dashboard and the loop went
-        on believing it was driving it, and never commanded again.
-
-        Reported on this rig, and the same defect ActorController.off had -
-        acting only when the software already believed the actor was on makes
-        OFF a no-op exactly when it is needed.
+        Read rather than remembered. Commanding only on a transition believed
+        from locals would leave the loop wrong for the rest of the brew once
+        anything else touched the actor: switch the element off from the
+        dashboard and the loop would go on believing it was driving it, and
+        never command again. Acting only when the software already believes
+        the actor is on makes OFF a no-op exactly when it is needed.
 
         The driver's state is preferred over the container's: find_by_id
         returns a container whose `instance` is the driver, and commands update
@@ -279,12 +276,12 @@ class PIDBoil(CBPiKettleLogic):
 
             # Deliberately not actor_on(heater, maxout) here.
             #
-            # That energized the element at full power before a single
+            # That would energize the element at full power before a single
             # temperature had been read, so a kettle started with a failed probe
-            # - or one already at boiling - went to full power immediately and
-            # stayed there until the first sample came back. A plain GPIOActor's
-            # on() also ignores the power argument and simply drives the pin
-            # high, so "on at maxout" was really "on at 100%".
+            # - or one already at boiling - would go to full power immediately
+            # and stay there until the first sample came back. A plain
+            # GPIOActor's on() also ignores the power argument and simply drives
+            # the pin high, so "on at maxout" is really "on at 100%".
             #
             # Switching off instead establishes a known state without the pulse,
             # and matters because actor state survives a restart: an element left
@@ -367,15 +364,15 @@ class PIDBoil(CBPiKettleLogic):
 
                 if current_temp is None or target_temp is None:
                     # Cannot know the temperature, so do not heat - but stay
-                    # alive. Returning or raising here ended temperature control
-                    # for the rest of the brew after a single bad read, with
-                    # nothing said to the brewer.
+                    # alive. Returning or raising here would end temperature
+                    # control for the rest of the brew after a single bad read,
+                    # with nothing said to the brewer.
                     sensor_failures += 1
                     # Unconditional, for the same reason as the zero-demand
-                    # path below: this used to act only when the loop believed
-                    # the heater was on, so a swallowed OFF failure flipped the
-                    # flag and it never retried - leaving an element energized
-                    # on a sensor fault, which is the one case it exists for.
+                    # path below: if this acted only when the loop believed the
+                    # heater was on, a swallowed OFF failure would flip the flag
+                    # and never be retried - leaving an element energized on a
+                    # sensor fault, which is the one case it exists for.
                     await self.actor_off(self.heater)
                     heater_is_on = False
                     heat_percent_old = None
@@ -490,9 +487,9 @@ class PIDBoil(CBPiKettleLogic):
         except asyncio.CancelledError as e:
             pass
         except Exception as e:
-            # Named for the plugin it is actually in. This said
-            # "BM_PIDSmartBoilWithPump", copied from another plugin, which sends
-            # anyone reading the log to the wrong file.
+            # Named for the plugin it is actually in: another plugin's name,
+            # such as "BM_PIDSmartBoilWithPump", would send anyone reading the
+            # log to the wrong file.
             logging.exception("PIDBoil error: %s", e)
         finally:
             self.running = False
@@ -566,11 +563,11 @@ class PIDArduino(object):
         # Anti-windup: stop integrating only when the integral is pushing
         # further into the rail the output is already against.
         #
-        # Freezing whenever the output was saturated - regardless of direction -
-        # meant a controller sitting at 0% could not begin recovering until the
-        # proportional term alone lifted it off the rail. On a kettle heating
-        # from cold the output is saturated for most of the ramp, so in practice
-        # the integral never contributed at all.
+        # Freezing whenever the output is saturated - regardless of direction -
+        # would leave a controller sitting at 0% unable to begin recovering
+        # until the proportional term alone lifted it off the rail. On a kettle
+        # heating from cold the output is saturated for most of the ramp, so the
+        # integral would never contribute at all.
         at_ceiling = self._lastOutput >= self._outputMax
         at_floor = self._lastOutput <= self._outputMin
         winding_up = (at_ceiling and error > 0) or (at_floor and error < 0)
