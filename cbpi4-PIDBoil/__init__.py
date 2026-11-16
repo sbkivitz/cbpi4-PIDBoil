@@ -78,6 +78,13 @@ class PIDBoil(CBPiKettleLogic):
     DEFAULT_D_C = 41.58
     DEFAULT_GAIN_TOLERANCE = 0.000001
 
+    # The rest of what an empty setting is taken as (blank_defaults).
+    DEFAULT_SAMPLE_TIME = 5
+    DEFAULT_MAX_OUTPUT = 100
+    DEFAULT_BOIL_THRESHOLD_C = 98
+    DEFAULT_BOIL_THRESHOLD_F = 208
+    DEFAULT_PLATEAU_MINUTES = 3
+
     # How little a vessel must rise to count as having stopped, in degrees.
     # A 5.5kW element in 40 litres climbs about 2 degrees a minute, so anything
     # this small over several minutes is not a heat-up.
@@ -92,13 +99,46 @@ class PIDBoil(CBPiKettleLogic):
     # considered over - enough that noise cannot rattle it in and out.
     PLATEAU_EXIT_DROP = 2.0
 
-    def _degree_ratio(self):
-        return 1.0 if self.TEMP_UNIT == "C" else 1.8
+    @staticmethod
+    def _unit_ratio(unit):
+        """Degrees of `unit` per degree Celsius: 1, or 1.8 for anything but "C"."""
+        return 1.0 if unit == "C" else 1.8
 
-    def _pid_gain(self, label, celsius_default, degree_ratio):
-        configured = self.props.get(label)
-        if configured is None or configured == "":
-            return celsius_default / degree_ratio, True
+    @classmethod
+    def blank_defaults(cls, unit):
+        """What run() uses for each setting left empty, in `unit` ("C" or "F").
+
+        run() takes its defaults from here, so the two can't drift apart. Every
+        setting has one: P, I and D are the Celsius-tuned gains divided by the
+        degree ratio, and the boil threshold is 98 C or 208 F.
+        """
+        ratio = cls._unit_ratio(unit)
+        return {
+            "P": cls.DEFAULT_P_C / ratio,
+            "I": cls.DEFAULT_I_C / ratio,
+            "D": cls.DEFAULT_D_C / ratio,
+            "SampleTime": cls.DEFAULT_SAMPLE_TIME,
+            "Max_Output": cls.DEFAULT_MAX_OUTPUT,
+            "Boil_Threshold": cls.DEFAULT_BOIL_THRESHOLD_C if unit == "C" else cls.DEFAULT_BOIL_THRESHOLD_F,
+            "Max_Boil_Output": cls.DEFAULT_BOIL_OUTPUT,
+            "Boil_Plateau_Minutes": cls.DEFAULT_PLATEAU_MINUTES,
+        }
+
+    def _degree_ratio(self):
+        return self._unit_ratio(self.TEMP_UNIT)
+
+    def _setting(self, label, blank):
+        """The setting `label`, or `blank` when it is empty: missing, null, or only spaces."""
+        value = self.props.get(label)
+        if value is None or str(value).strip() == "":
+            return blank
+        return value
+
+    def _pid_gain(self, label, blank):
+        """(gain, whether it is the default) for P, I or D."""
+        configured = self._setting(label, None)
+        if configured is None:
+            return blank, True
         return float(configured), False
 
     def _has_legacy_celsius_default_gains(self):
@@ -290,21 +330,20 @@ class PIDBoil(CBPiKettleLogic):
             await self.actor_off(self.heater)
 
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
-            sampleTime = int(self.props.get("SampleTime",5))
-            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
+            # Each setting left empty is what blank_defaults() says it is.
+            blank = self.blank_defaults(self.TEMP_UNIT)
+            sampleTime = int(self._setting("SampleTime", blank["SampleTime"]))
 
             degree_ratio = self._degree_ratio()
-            p, p_defaulted = self._pid_gain("P", self.DEFAULT_P_C, degree_ratio)
-            i, i_defaulted = self._pid_gain("I", self.DEFAULT_I_C, degree_ratio)
-            d, d_defaulted = self._pid_gain("D", self.DEFAULT_D_C, degree_ratio)
+            p, p_defaulted = self._pid_gain("P", blank["P"])
+            i, i_defaulted = self._pid_gain("I", blank["I"])
+            d, d_defaulted = self._pid_gain("D", blank["D"])
             legacy_default_gains = self._has_legacy_celsius_default_gains()
             if legacy_default_gains:
-                p = self.DEFAULT_P_C / degree_ratio
-                i = self.DEFAULT_I_C / degree_ratio
-                d = self.DEFAULT_D_C / degree_ratio
-            maxout = int(self.props.get("Max_Output", 100))
-            maxtempboil = float(self.props.get("Boil_Threshold", boilthreshold))
-            maxboilout = int(self.props.get("Max_Boil_Output", self.DEFAULT_BOIL_OUTPUT))
+                p, i, d = blank["P"], blank["I"], blank["D"]
+            maxout = int(self._setting("Max_Output", blank["Max_Output"]))
+            maxtempboil = float(self._setting("Boil_Threshold", blank["Boil_Threshold"]))
+            maxboilout = int(self._setting("Max_Boil_Output", blank["Max_Boil_Output"]))
 
             heater_is_on = False
             heat_percent_old = None
@@ -341,7 +380,7 @@ class PIDBoil(CBPiKettleLogic):
             boil_latched = False
             boil_entry_temp = None
             plateau_window = max(0.0, float(
-                self.props.get("Boil_Plateau_Minutes", 3) or 0
+                self._setting("Boil_Plateau_Minutes", blank["Boil_Plateau_Minutes"]) or 0
             )) * 60.0
             self._plateau_since = None
             self._plateau_anchor = None
