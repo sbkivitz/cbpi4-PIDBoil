@@ -22,7 +22,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 - P - proportional value (empty: 117.0795 per °C, 65.04 per °F)
 - I - integral value (empty: 0.2747 per °C, 0.1526 per °F)
 - D - derivative value (empty: 41.58 per °C, 23.1 per °F)
-- SampleTime - 2 or 5 seconds -> how often the logic calculates the power setting (empty: 5)
+- SampleTime - 2 or 5 seconds -> how often the logic calculates the power setting (empty: 5). Anything from 1 to 60 is used as set; anything else is 5, and the brewer is told
 - Max Output - the most power the PID uses before the boil threshold is reached (empty: 100%)
 - Boil Threshold - Above this temperature the heater will be set to Max Boil Output Power (empty: 98°C / 208F)
 - Max Boil Output - Power (%) that is used above Boil Threshold Temperature (empty: 85%)
@@ -32,6 +32,7 @@ The plugin tells CraftBeerPi what it uses for each setting left empty (`blank_de
 
 ### Changelog
 
+- 18.11.26: (0.0.9.post5, this fork) A SampleTime from 1 to 60 seconds is used as set; anything else is 5, and the brewer is told, as BoilPower and PIDHerms do. Before, any whole number was used: at 3600 the element stayed as the first decision left it for an hour, through a failed probe. Text such as "2.5" or "inf" stopped the logic starting.
 - 16.11.26: (0.0.9.post4, this fork) The plugin tells CraftBeerPi what it uses for each setting left empty (`blank_defaults`), for CraftBeerPi 4.7.7.post41 or later to show and fill in. The empty values are the ones it always used, now read from one table by the plugin and by CraftBeerPi alike. A setting that is only spaces, or null, counts as empty too; it used to stop the logic starting.
 - 13.11.26: (0.0.9.post3, this fork) Comments describe the code. No change in behaviour.
 - 29.10.26: (0.0.9.post2, this fork) A temperature reading - or a target - that is not a finite number is treated as no reading: the element off, the brewer told, heating back when a real reading returns. Before, +inf chose the fixed boil power (85% by default) for as long as it lasted, and one NaN stuck in the PID's integral, so the element never heated again that brew.

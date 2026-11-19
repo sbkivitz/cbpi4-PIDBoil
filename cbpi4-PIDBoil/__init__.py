@@ -85,6 +85,14 @@ class PIDBoil(CBPiKettleLogic):
     DEFAULT_BOIL_THRESHOLD_F = 208
     DEFAULT_PLATEAU_MINUTES = 3
 
+    # SampleTime, the seconds between control decisions: the setting offers 2
+    # and 5, and anything from 1 to 60 is used as it is. Faster than once a
+    # second is faster than a probe gives a new reading. The element stays as
+    # one decision left it until the next, so a longer one would leave it
+    # unwatched - for an hour at 3600, and for good at infinity.
+    MIN_SAMPLE_TIME = 1
+    MAX_SAMPLE_TIME = 60
+
     # How little a vessel must rise to count as having stopped, in degrees.
     # A 5.5kW element in 40 litres climbs about 2 degrees a minute, so anything
     # this small over several minutes is not a heat-up.
@@ -133,6 +141,37 @@ class PIDBoil(CBPiKettleLogic):
         if value is None or str(value).strip() == "":
             return blank
         return value
+
+    def _sample_time(self, blank):
+        """Seconds between control decisions: SampleTime when it is a number
+        from MIN_SAMPLE_TIME to MAX_SAMPLE_TIME, else `blank`, the default.
+        Empty is the default, quietly; anything else - text, a number out of
+        range or one that isn't finite - is the default, and the brewer is
+        told. Never raises."""
+        raw = self._setting("SampleTime", None)
+        if raw is None:
+            return blank
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            seconds = float("nan")
+        # A NaN fails both comparisons, and an infinity the second.
+        if self.MIN_SAMPLE_TIME <= seconds <= self.MAX_SAMPLE_TIME:
+            return seconds
+        shown = repr(raw)
+        if len(shown) > 24:
+            shown = shown[:21] + "..."
+        message = ("SampleTime is set to {}. It has to be from {} to {} seconds, "
+                   "so {} is used instead.".format(
+                       shown, self.MIN_SAMPLE_TIME, self.MAX_SAMPLE_TIME, blank))
+        logging.warning("PIDBoil: %s", message)
+        try:
+            name = getattr(getattr(self, "kettle", None), "name", None) or "Kettle"
+            self.cbpi.notify("{} configuration".format(name), message,
+                             NotificationType.WARNING)
+        except Exception:  # noqa: BLE001 - a notice must not stop the logic starting
+            pass
+        return blank
 
     def _pid_gain(self, label, blank):
         """(gain, whether it is the default) for P, I or D."""
@@ -299,7 +338,7 @@ class PIDBoil(CBPiKettleLogic):
             # can fail.
             #
             # This sat below the setting parsing, and those parses can raise -
-            # int("abc") on a SampleTime, float("") on a threshold. When they
+            # int("zzz") on Max_Output, float("hot") on Boil_Threshold. When they
             # did, run() went to its finally, which could not command a heater
             # it had never resolved. On a rig driven by hand that is the
             # dangerous case: the brewer switches an element on manually, starts
@@ -332,7 +371,7 @@ class PIDBoil(CBPiKettleLogic):
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
             # Each setting left empty is what blank_defaults() says it is.
             blank = self.blank_defaults(self.TEMP_UNIT)
-            sampleTime = int(self._setting("SampleTime", blank["SampleTime"]))
+            sampleTime = self._sample_time(blank["SampleTime"])
 
             degree_ratio = self._degree_ratio()
             p, p_defaulted = self._pid_gain("P", blank["P"])
